@@ -41,14 +41,14 @@ IGNORE_INDEX = 255 # Valor do pixel para a classe de ignorar (void)
 
 # Original model Training Hyperparameters
 BATCH_SIZE = 32
-EPOCHS = 200
+EPOCHS = 300
 LEARNING_RATE = 1e-4
 
 # Quantized model training hyperparameters
-BIT_WIDTH = 4 # Valor que sera escrito no nome dos arquivos
-WEIGHT_BIT_WIDTH = 2 # Bit width para os pesos do modelo quantizado
+BIT_WIDTH = "w4a4" # Valor que sera escrito no nome dos arquivos
+WEIGHT_BIT_WIDTH = 4 # Bit width para os pesos do modelo quantizado
 ACT_BIT_WIDTH = 4 # Bit width para as ativacoes do modelo quantizado
-OUT_BIT_WIDTH = 2 # Bit width para as saidas do modelo quantizado
+OUT_BIT_WIDTH = 8 # Bit width para as saidas do modelo quantizado
 QAT_BATCH_SIZE = 32 # Batch size menor ou igual ao original para o treinamento do modelo quantizado, para evitar problemas de memoria. Ajuste conforme a capacidade da sua GPU.
 QAT_EPOCHS = 50 # Treinar por menos epocas do que o modelo original, pois o modelo quantizado tem menos capacidade e pode convergir mais rapido
 QAT_LEARNING_RATE = 1e-4

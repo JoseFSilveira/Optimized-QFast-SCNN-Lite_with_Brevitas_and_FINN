@@ -13,6 +13,8 @@ The following changes to make it compatible with quantization and translation to
     -> The first concat operation only concatenates the tensors with depth=32, resulting in a new tensor with depth=128.
     -> The second concat operation concatenates the original 128-depth tensor with the previously generated 128-depth tensor, resulting in the final tensor with depth=256.
 --> Standard Add operations were replaced by Brevitas qnn.QuantEltwiseAdd to allow for addition of QuantTensors.
+--> Dropout layers were removed from the model. QAT does not need dropout layers.
+    -> nn.identity() was added in place of dropout layers to not alter the layer indexes, which is important for loading the weights for QAT.
 --> The last upsampling layer is removed to avoid a large upsampling factor with 'nearest' mode, which can comprimise severly the accuracy of the model.
     -> obs: The last upsampling layer can be done in external post-processing step, with the output of the model being passed to a CPU or small GPU.
 '''
@@ -42,10 +44,17 @@ class UintActPerTensorFloat(Uint8ActPerTensorFloat):
     """
     bit_width = ACT_BIT_WIDTH
 
-class IntOutActPerTensorFloat(Uint8ActPerTensorFloat):
+class IntOutActPerTensorFloat(Int8ActPerTensorFloat):
     """
-    Custom subclass of Int8WeightPerTensorFloat to allow for a different bit width to be set at runtime.
-    This is necessary since the original Int8WeightPerTensorFloat class has a fixed bit width of 8 bits.
+    Custom subclass of Int8ActPerTensorFloat to allow for a different bit width to be set at runtime.
+    This is necessary since the original Int8ActPerTensorFloat class has a fixed bit width of 8 bits.
+    """
+    bit_width = OUT_BIT_WIDTH
+
+class UintOutActPerTensorFloat(Uint8ActPerTensorFloat):
+    """
+    Custom subclass of Uint8ActPerTensorFloat to allow for a different bit width to be set at runtime.
+    This is necessary since the original Uint8ActPerTensorFloat class has a fixed bit width of 8 bits.
     """
     bit_width = OUT_BIT_WIDTH
 
@@ -74,7 +83,7 @@ class AvgPoolFINNFriendly(nn.Module):
                                 groups=channels,
                                 bias=False,
                                 weight_quant=IntWeightPerTensorFloat,
-                                output_quant=IntActPerTensorFloat,
+                                
                                 return_quant_tensor=False)
         # Freeze the weights of the depthwise convolution layer to 1
         for param in self.pool.parameters():
@@ -175,7 +184,6 @@ class _ConvBNReLU(nn.Module):
         self.conv = nn.Sequential(
             qnn.QuantConv2d(in_channels, out_channels, kernel_size, stride, padding, bias=False,
                             weight_quant=IntWeightPerTensorFloat,
-                            output_quant=IntActPerTensorFloat,
                             return_quant_tensor=True),
             nn.BatchNorm2d(out_channels),
             qnn.QuantReLU(inplace=True, act_quant=UintActPerTensorFloat, return_quant_tensor=True)
@@ -192,14 +200,12 @@ class _DSConv(nn.Module):
         super(_DSConv, self).__init__()
         self.conv = nn.Sequential(
             qnn.QuantConv2d(dw_channels, dw_channels, 3, stride, 1, groups=dw_channels, bias=False,
-                            weight_quant=IntWeightPerTensorFloat,
-                            output_quant=IntActPerTensorFloat,
+                            weight_quant=IntWeightPerTensorFloat,                            
                             return_quant_tensor=True),
             nn.BatchNorm2d(dw_channels),
             qnn.QuantReLU(inplace=True, act_quant=UintActPerTensorFloat, return_quant_tensor=True),
             qnn.QuantConv2d(dw_channels, out_channels, 1, bias=False,
                             weight_quant=IntWeightPerTensorFloat,
-                            output_quant=IntActPerTensorFloat,
                             return_quant_tensor=True),
             nn.BatchNorm2d(out_channels),
             qnn.QuantReLU(inplace=True, act_quant=UintActPerTensorFloat, return_quant_tensor=True)
@@ -214,8 +220,7 @@ class _DWConv(nn.Module):
         super(_DWConv, self).__init__()
         self.conv = nn.Sequential(
             qnn.QuantConv2d(dw_channels, out_channels, 3, stride, 1, groups=dw_channels, bias=False,
-                            weight_quant=IntWeightPerTensorFloat,
-                            output_quant=IntActPerTensorFloat,
+                            weight_quant=IntWeightPerTensorFloat,                            
                             return_quant_tensor=True),
             nn.BatchNorm2d(out_channels),
             qnn.QuantReLU(inplace=True, act_quant=UintActPerTensorFloat, return_quant_tensor=True)
@@ -239,7 +244,6 @@ class LinearBottleneck(nn.Module):
             # pw-linear
             qnn.QuantConv2d(in_channels * t, out_channels, 1, bias=False,
                             weight_quant=IntWeightPerTensorFloat,
-                            output_quant=IntActPerTensorFloat,
                             return_quant_tensor=True),
             nn.BatchNorm2d(out_channels),
         )
@@ -366,7 +370,6 @@ class FeatureUpsampleModule(nn.Module):
         self.conv_lower_res = nn.Sequential(
             qnn.QuantConv2d(out_channels, out_channels, 1,
                             weight_quant=IntWeightPerTensorFloat,
-                            output_quant=IntActPerTensorFloat,
                             return_quant_tensor=False), # Relu will be applied after, so the output of this layer does not need to be quantized.
             nn.BatchNorm2d(out_channels)
         )
@@ -392,10 +395,10 @@ class Classifer(nn.Module):
         self.dsconv1 = _DSConv(dw_channels, dw_channels, stride)
         self.dsconv2 = _DSConv(dw_channels, dw_channels, stride)
         self.conv = nn.Sequential(
-            nn.Dropout(0.1),
+            nn.Identity(), # in place of dropout to not alter layer indexes.
             qnn.QuantConv2d(dw_channels, num_classes, 1,
                             weight_quant=IntWeightPerTensorFloat,
-                            output_quant=IntOutActPerTensorFloat,
+                            act_quant=IntOutActPerTensorFloat,
                             return_quant_tensor=False)
         )
 
