@@ -1,0 +1,25 @@
+*.i
+*.ii
+*.gpu
+*.ptx
+*.cubin
+*.fatbin
+*.venv
+*.ipynb_checkpoints
+*.pyc
+*.code-workspace
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Ignore Datasets
+Cityscapes_Dataset/
+
+# Ignore estimates folders
+finn-estimates/
+hls_output_estimates_only/
+rtl_output_estimates_only/
+output_estimates_only/
+test/
