@@ -27,7 +27,7 @@ class FastSCNN(nn.Module):
         #self.aux = aux
         self.learning_to_downsample = LearningToDownsample(32, 48, 64)
         # The number of blocks in the GlobalFeatureExtractor was reduced from [3, 3, 3] to [2, 2, 2] to reduce model depth and FPGA FIFO's.
-        self.global_feature_extractor = GlobalFeatureExtractor(in_channels=64, block_channels=[64, 96, 128], out_channels=128, t=2, num_blocks=[2, 2, 2])
+        self.global_feature_extractor = GlobalFeatureExtractor(in_channels=64, block_channels=[64, 96, 128], out_channels=128, t=2, num_blocks=[1, 1, 1])
         self.feature_upsample = FeatureUpsampleModule(128, 128)
         self.classifier = Classifer(128, num_classes)
         # Removing the tuple output since it can cause issues when translating the model to ONNX and then to FINN, and the auxiliary output is not being used in the training loop
@@ -77,37 +77,6 @@ class _ConvBNReLU(nn.Module):
         return self.conv(x)
 
 
-class _DSConv(nn.Module):
-    """Depthwise Separable Convolutions"""
-
-    def __init__(self, dw_channels, out_channels, stride=1, **kwargs):
-        super(_DSConv, self).__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(dw_channels, dw_channels, 3, stride, 1, groups=dw_channels, bias=False),
-            nn.BatchNorm2d(dw_channels),
-            nn.ReLU(True),
-            nn.Conv2d(dw_channels, out_channels, 1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(True)
-        )
-
-    def forward(self, x):
-        return self.conv(x)
-
-
-class _DWConv(nn.Module):
-    def __init__(self, dw_channels, out_channels, stride=1, **kwargs):
-        super(_DWConv, self).__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(dw_channels, out_channels, 3, stride, 1, groups=dw_channels, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(True)
-        )
-
-    def forward(self, x):
-        return self.conv(x)
-
-
 class LinearBottleneck(nn.Module):
     """LinearBottleneck used in MobileNetV2"""
 
@@ -118,7 +87,7 @@ class LinearBottleneck(nn.Module):
             # pw
             _ConvBNReLU(in_channels, in_channels * t, 1),
             # dw
-            _DWConv(in_channels * t, in_channels * t, stride),
+            _ConvBNReLU(in_channels * t, in_channels * t, stride=stride, padding=1),
             # pw-linear
             nn.Conv2d(in_channels * t, out_channels, 1, bias=False),
             nn.BatchNorm2d(out_channels)
@@ -167,8 +136,8 @@ class LearningToDownsample(nn.Module):
     def __init__(self, dw_channels1=32, dw_channels2=48, out_channels=64, **kwargs):
         super(LearningToDownsample, self).__init__()
         self.conv = _ConvBNReLU(3, dw_channels1, 3, 2)
-        self.dsconv1 = _DSConv(dw_channels1, dw_channels2, 2)
-        self.dsconv2 = _DSConv(dw_channels2, out_channels, 2)
+        self.dsconv1 = _ConvBNReLU(dw_channels1, dw_channels2, stride=2, padding=1)
+        self.dsconv2 = _ConvBNReLU(dw_channels2, out_channels, stride=2, padding=1)
 
     def forward(self, x):
         x = self.conv(x)
@@ -203,39 +172,13 @@ class GlobalFeatureExtractor(nn.Module):
         return x
 
 
-class FeatureFusionModule(nn.Module):
-    """Feature fusion module"""
-
-    def __init__(self, highter_in_channels, lower_in_channels, out_channels, scale_factor=4, **kwargs):
-        super(FeatureFusionModule, self).__init__()
-        self.scale_factor = scale_factor
-        self.dwconv = _DWConv(lower_in_channels, out_channels, 1)
-        self.conv_lower_res = nn.Sequential(
-            nn.Conv2d(out_channels, out_channels, 1),
-            nn.BatchNorm2d(out_channels)
-        )
-        self.conv_higher_res = nn.Sequential(
-            nn.Conv2d(highter_in_channels, out_channels, 1),
-            nn.BatchNorm2d(out_channels)
-        )
-        self.relu = nn.ReLU(True)
-
-    def forward(self, higher_res_feature, lower_res_feature):
-        lower_res_feature = F.interpolate(lower_res_feature, scale_factor=4, mode='nearest')
-        lower_res_feature = self.dwconv(lower_res_feature)
-        lower_res_feature = self.conv_lower_res(lower_res_feature)
-
-        higher_res_feature = self.conv_higher_res(higher_res_feature)
-        out = higher_res_feature + lower_res_feature
-        return self.relu(out)
-
 class FeatureUpsampleModule(nn.Module):
     """Feature fusion module"""
 
     def __init__(self, in_channels, out_channels, scale_factor=4, **kwargs):
         super(FeatureUpsampleModule, self).__init__()
         self.scale_factor = scale_factor
-        self.dwconv = _DWConv(in_channels, out_channels, 1)
+        self.dwconv = _ConvBNReLU(in_channels, out_channels, stride=1, padding=1)
         self.conv_lower_res = nn.Sequential(
             nn.Conv2d(out_channels, out_channels, 1),
             nn.BatchNorm2d(out_channels)
@@ -254,8 +197,8 @@ class Classifer(nn.Module):
 
     def __init__(self, dw_channels, num_classes, stride=1, **kwargs):
         super(Classifer, self).__init__()
-        self.dsconv1 = _DSConv(dw_channels, dw_channels, stride)
-        self.dsconv2 = _DSConv(dw_channels, dw_channels, stride)
+        self.dsconv1 = _ConvBNReLU(dw_channels, dw_channels, stride=stride, padding=1)
+        self.dsconv2 = _ConvBNReLU(dw_channels, dw_channels, stride=stride, padding=1)
         self.conv = nn.Sequential(
             nn.Dropout(0.1),
             nn.Conv2d(dw_channels, num_classes, 1)

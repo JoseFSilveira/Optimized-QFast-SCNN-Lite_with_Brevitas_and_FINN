@@ -30,8 +30,8 @@ NUM_WORKERS = os.cpu_count() // 2 # Numero de workers para os dataloaders, ajust
 # Sizing and cropping configs
 #IM_HEIGHT = 512
 SQUARE_IM_WIDTH = 1024
-IM_HEIGHT = 512
-IM_WIDTH = 512
+IM_HEIGHT = 256
+IM_WIDTH = 256
 IM_SIZE = [IM_HEIGHT, IM_WIDTH] # Tamanho da imagem de entrada para o modelo, que deve ser consistente com o tamanho das imagens do dataset.
 #CROP_SIZE = [768, 768] # Tamanho do crop aleatorio aplicado durante a data augmentation, o qual ajuda a reduzir o uso de memoria durante o treinamento do modelo quantizado
 
@@ -41,12 +41,12 @@ IGNORE_INDEX = 255 # Valor do pixel para a classe de ignorar (void)
 
 # Original model Training Hyperparameters
 BATCH_SIZE = 32
-EPOCHS = 300
+EPOCHS = 200
 LEARNING_RATE = 1e-4
 
 # Quantized model training hyperparameters
-BIT_WIDTH = "w4a4" # Valor que sera escrito no nome dos arquivos
-WEIGHT_BIT_WIDTH = 4 # Bit width para os pesos do modelo quantizado
+BIT_WIDTH = "w2a4" # Valor que sera escrito no nome dos arquivos
+WEIGHT_BIT_WIDTH = 2 # Bit width para os pesos do modelo quantizado
 ACT_BIT_WIDTH = 4 # Bit width para as ativacoes do modelo quantizado
 OUT_BIT_WIDTH = 8 # Bit width para as saidas do modelo quantizado
 QAT_BATCH_SIZE = 32 # Batch size menor ou igual ao original para o treinamento do modelo quantizado, para evitar problemas de memoria. Ajuste conforme a capacidade da sua GPU.

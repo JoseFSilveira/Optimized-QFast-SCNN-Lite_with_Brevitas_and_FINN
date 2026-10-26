@@ -66,52 +66,6 @@ class IntWeightPerTensorFloat(Int8WeightPerTensorFloat):
     bit_width = WEIGHT_BIT_WIDTH
 
 
-class AvgPoolFINNFriendly(nn.Module):
-    """
-    A replacement for the adaptive average pooling layers in the original model, which is compatible with quantization and export to ONNX and FINN.
-    This is done by using a depthwise convolution with kernel weights as 1/kernel_size, which is equivalent to average pooling, but allows for quantization and export to ONNX and FINN.
-    """
-
-    def __init__(self, channels: int, kernel_size: tuple[int, int] | int, return_quant_tensor=False):
-        super().__init__()
-        self.return_quant_tensor = return_quant_tensor
-        # Create the depthwise convolution layer with frozen weights of 1, which results in a depthwise sum of pixels in the kernel area.
-        self.pool = qnn.QuantConv2d(in_channels=channels,
-                                out_channels=channels,
-                                kernel_size=kernel_size,
-                                stride=kernel_size,
-                                groups=channels,
-                                bias=False,
-                                weight_quant=IntWeightPerTensorFloat,
-                                
-                                return_quant_tensor=False)
-        # Freeze the weights of the depthwise convolution layer to 1
-        for param in self.pool.parameters():
-            param.requires_grad = False
-        nn.init.constant_(self.pool.weight.data, 1.0)
-        self.pool.weight.data = self.pool.weight.data.to(torch.float32) # make sure the weights are in float32, since something was promoting the weights to double precision, which is not supported by FINN.
-
-        # Define the kernel area for the average pooling operation
-        if type(kernel_size) == int:
-            kernel_area = kernel_size * kernel_size
-        else:
-            kernel_area = kernel_size[0] * kernel_size[1]
-        avgpool_scale_factor = 1.0 / kernel_area # Defining a scale factor to assert a multiplication the forward method, since FINN does not support division operations.
-
-        # The output of the depthwise convolution layer is divided by the kernel area to get the average pooling result.
-        self.div = lambda x: x * avgpool_scale_factor
-
-        # Quantize the output of the average pooling operation using per-tensor quantization with a floating-point scale.
-        self.act_quant = qnn.QuantIdentity(act_quant=IntActPerTensorFloat, return_quant_tensor=True)
-
-    def forward(self, x):
-        x = self.pool(x)
-        x = self.div(x)
-        if self.return_quant_tensor:
-            x = self.act_quant(x)
-        return x
-
-
 class CustomQuantCat(qnn.QuantCat):
     '''
     A modification of the original qnn.QuantCat replacing QuantTensor.cat() with torch.cat(), since the QuantTensor does not have cat() method anymore (Brevitas Bug).
@@ -144,7 +98,7 @@ class QFastSCNN(nn.Module):
 
         self.inp_quant = qnn.QuantIdentity(act_quant=IntActPerTensorFloat, return_quant_tensor=True)
         self.learning_to_downsample = LearningToDownsample(32, 48, 64)
-        self.global_feature_extractor = GlobalFeatureExtractor(in_channels=64, block_channels=[64, 96, 128], out_channels=128, t=2, num_blocks=[2, 2, 2])
+        self.global_feature_extractor = GlobalFeatureExtractor(in_channels=64, block_channels=[64, 96, 128], out_channels=128, t=2, num_blocks=[1, 1, 1])
         self.feature_upsample = FeatureUpsampleModule(128, 128)
         self.classifier = Classifer(128, num_classes)
 
@@ -193,43 +147,6 @@ class _ConvBNReLU(nn.Module):
         return self.conv(x)
 
 
-class _DSConv(nn.Module):
-    """Depthwise Separable Convolutions"""
-
-    def __init__(self, dw_channels, out_channels, stride=1, **kwargs):
-        super(_DSConv, self).__init__()
-        self.conv = nn.Sequential(
-            qnn.QuantConv2d(dw_channels, dw_channels, 3, stride, 1, groups=dw_channels, bias=False,
-                            weight_quant=IntWeightPerTensorFloat,                            
-                            return_quant_tensor=True),
-            nn.BatchNorm2d(dw_channels),
-            qnn.QuantReLU(inplace=True, act_quant=UintActPerTensorFloat, return_quant_tensor=True),
-            qnn.QuantConv2d(dw_channels, out_channels, 1, bias=False,
-                            weight_quant=IntWeightPerTensorFloat,
-                            return_quant_tensor=True),
-            nn.BatchNorm2d(out_channels),
-            qnn.QuantReLU(inplace=True, act_quant=UintActPerTensorFloat, return_quant_tensor=True)
-        )
-
-    def forward(self, x):
-        return self.conv(x)
-
-
-class _DWConv(nn.Module):
-    def __init__(self, dw_channels, out_channels, stride=1, **kwargs):
-        super(_DWConv, self).__init__()
-        self.conv = nn.Sequential(
-            qnn.QuantConv2d(dw_channels, out_channels, 3, stride, 1, groups=dw_channels, bias=False,
-                            weight_quant=IntWeightPerTensorFloat,                            
-                            return_quant_tensor=True),
-            nn.BatchNorm2d(out_channels),
-            qnn.QuantReLU(inplace=True, act_quant=UintActPerTensorFloat, return_quant_tensor=True)
-        )
-
-    def forward(self, x):
-        return self.conv(x)
-
-
 class LinearBottleneck(nn.Module):
     """LinearBottleneck used in MobileNetV2"""
 
@@ -240,7 +157,7 @@ class LinearBottleneck(nn.Module):
             # pw
             _ConvBNReLU(in_channels, in_channels * t, 1),
             # dw
-            _DWConv(in_channels * t, in_channels * t, stride),
+            _ConvBNReLU(in_channels * t, in_channels * t, stride=stride, padding=1),
             # pw-linear
             qnn.QuantConv2d(in_channels * t, out_channels, 1, bias=False,
                             weight_quant=IntWeightPerTensorFloat,
@@ -288,13 +205,17 @@ class PyramidPooling(nn.Module):
         self.pool_out_H = [1, 2, 4, 8]  # Kernel sizes for the pyramid pooling layers
         self.kernel_size = [in_H // pool_out for pool_out in self.pool_out_H]  # Kernel sizes for the pyramid pooling layers during training
 
-        # The original model uses adaptive average pooling, which can be replaced by a standard Average Pooling with pre-defined kernel sizes.
-        # Necessary to create new instance for each pool size since the output size is a parameter in the quantized version.
+        # The original model uses adaptive average pooling. This operation is being replaced by standard convs to be translated to MVAU instead of VVAU.
+        self.pool = nn.ModuleList()
 
-        self.pool1 = AvgPoolFINNFriendly(in_channels, self.kernel_size[0], return_quant_tensor=True)
-        self.pool2 = AvgPoolFINNFriendly(in_channels, self.kernel_size[1], return_quant_tensor=True)
-        self.pool3 = AvgPoolFINNFriendly(in_channels, self.kernel_size[2], return_quant_tensor=True)
-        self.pool4 = AvgPoolFINNFriendly(in_channels, self.kernel_size[3], return_quant_tensor=True)
+        for kernel_size in self.kernel_size:
+            pool = qnn.QuantConv2d(in_channels, in_channels, 
+                                    kernel_size=kernel_size,
+                                    stride=kernel_size,
+                                    bias=False,
+                                    weight_quant=IntWeightPerTensorFloat,
+                                    return_quant_tensor=True)
+            self.pool.append(pool)
 
         # First Concat operation to concatenate the features with depth=32, resulting in a new tensor with depth=128; return_quant_tensor=False and output_quant=None since the next concat operation will quantize the output again.
         self.concat1 = CustomQuantCat(return_quant_tensor=False,
@@ -308,10 +229,10 @@ class PyramidPooling(nn.Module):
 
     def forward(self, x):
 
-        feat1 = self.upsample(self.conv1(self.pool1(x)), scale_factor=self.kernel_size[0])
-        feat2 = self.upsample(self.conv2(self.pool2(x)), scale_factor=self.kernel_size[1])
-        feat3 = self.upsample(self.conv3(self.pool3(x)), scale_factor=self.kernel_size[2])
-        feat4 = self.upsample(self.conv4(self.pool4(x)), scale_factor=self.kernel_size[3])
+        feat1 = self.upsample(self.conv1(self.pool[0](x)), scale_factor=self.kernel_size[0])
+        feat2 = self.upsample(self.conv2(self.pool[1](x)), scale_factor=self.kernel_size[1])
+        feat3 = self.upsample(self.conv3(self.pool[2](x)), scale_factor=self.kernel_size[2])
+        feat4 = self.upsample(self.conv4(self.pool[3](x)), scale_factor=self.kernel_size[3])
 
         feat_concat = self.concat1([feat1, feat2, feat3, feat4])
         x = self.concat2([x, feat_concat])
@@ -324,8 +245,8 @@ class LearningToDownsample(nn.Module):
     def __init__(self, dw_channels1=32, dw_channels2=48, out_channels=64, **kwargs):
         super(LearningToDownsample, self).__init__()
         self.conv = _ConvBNReLU(3, dw_channels1, 3, 2)
-        self.dsconv1 = _DSConv(dw_channels1, dw_channels2, 2)
-        self.dsconv2 = _DSConv(dw_channels2, out_channels, 2)
+        self.dsconv1 = _ConvBNReLU(dw_channels1, dw_channels2, stride=2, padding=1)
+        self.dsconv2 = _ConvBNReLU(dw_channels2, out_channels, stride=2, padding=1)
 
     def forward(self, x):
         x = self.conv(x)
@@ -366,7 +287,7 @@ class FeatureUpsampleModule(nn.Module):
     def __init__(self, in_channels, out_channels, scale_factor=4, **kwargs):
         super(FeatureUpsampleModule, self).__init__()
         self.scale_factor = scale_factor
-        self.dwconv = _DWConv(in_channels, out_channels, 1)
+        self.dwconv = _ConvBNReLU(in_channels, out_channels, stride=1, padding=1)
         self.conv_lower_res = nn.Sequential(
             qnn.QuantConv2d(out_channels, out_channels, 1,
                             weight_quant=IntWeightPerTensorFloat,
@@ -392,14 +313,14 @@ class Classifer(nn.Module):
 
     def __init__(self, dw_channels, num_classes, stride=1, **kwargs):
         super(Classifer, self).__init__()
-        self.dsconv1 = _DSConv(dw_channels, dw_channels, stride)
-        self.dsconv2 = _DSConv(dw_channels, dw_channels, stride)
+        self.dsconv1 = _ConvBNReLU(dw_channels, dw_channels, stride=stride, padding=1)
+        self.dsconv2 = _ConvBNReLU(dw_channels, dw_channels, stride=stride, padding=1)
         self.conv = nn.Sequential(
             nn.Identity(), # in place of dropout to not alter layer indexes.
             qnn.QuantConv2d(dw_channels, num_classes, 1,
                             weight_quant=IntWeightPerTensorFloat,
                             act_quant=IntOutActPerTensorFloat,
-                            return_quant_tensor=False)
+                            return_quant_tensor=True)
         )
 
     def forward(self, x):
