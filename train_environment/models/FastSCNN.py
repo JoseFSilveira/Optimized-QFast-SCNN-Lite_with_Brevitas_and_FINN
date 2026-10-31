@@ -7,10 +7,13 @@
 '''
 From repo https://github.com/Tramac/Fast-SCNN-pytorch with the following modifications to make it compatible with translation to ONNX and then to FINN:
 --> The auxiliary output and the corresponding code in the training loop were removed since they are not being used in the training and can cause issues when translating the model to ONNX and then to FINN, which do not support multiple outputs.
+--> All depthwise separable convolutions were replaced with standard convolutions.
+--> Average Pooling layers were replaced by standard convolution layers with same inputs and outputs of original model. Kernel size and padding were set to match the original average pooling layer.
 --> The number of blocks in the GlobalFeatureExtractor was reduced from [3, 3, 3] to [2, 2, 2] to reduce model depth and FPGA FIFO's.
 --> Expand factor 't' reduced from 6 to 2 in the GlobalFeatureExtractor to reduce the number of parameters.
 --> The interpolation upsamples in pyramid pooling and feature fusion modules were changed to use 'nearest' mode instead of 'bilinear' to avoid issues when translating the model to ONNX and then to FINN, which do not support 'bilinear' mode with align_corners=True.
 --> The pool sizes in the pyramid pooling module were changed to be divisible by the input image size (in this case 32 and 64) to avoid issues when translating the model to ONNX and then to FINN.
+--> Feature Fusion module was replaced by a new Feature Upsample Module that only upsamples the features from the Global Feature Extractor to match the input image size,the long skip connection was removed.
 '''
 
 """Fast Segmentation Convolutional Neural Network"""
