@@ -5,13 +5,6 @@ The following changes to make it compatible with quantization and translation to
 --> The weights are quantized to 8 bits using per-tensor quantization with a floating-point scale.
 --> Added "qat" mode to the model, which allows for quantization-aware training and export to ONNX and FINN. This mode enables the final upsampling layer to be used.
 --> Added "finn" mode to the model, which is used for QONNX export for FINN framework. In this mode, the input preprocessing is done in the model, since FINN expects uint8 inputs.
---> PyramidPooling F.interpolate bilinear with final tensor size as argument is replaced by another F.interpolate with nearest neighbor interpolation with pre-calculated scale factors.
---> The adaptive average pooling layers are replaced by depthwise Conv layers ith kernel weights as 1/kernel_size, which is equivalent to average pooling, but allows for quantization and export to ONNX and FINN.
---> torch.cat() was replaced by a modification of Brevitas qnn.QuantCat to allow for concatenation of QuantTensors, since the QuantTensor class does not have a cat() method anymore (Brevitas Bug).
---> The original concat operation was replaced by a two-stage cascade of concat operations to make the operation compatible for hardware implementation.
-    -> The original model had a concatenation of tensors with depths [128, 32, 32, 32, 32] to form a new tensor with depth=256, though Hardware concat layer requires tensors with equal shapes.
-    -> The first concat operation only concatenates the tensors with depth=32, resulting in a new tensor with depth=128.
-    -> The second concat operation concatenates the original 128-depth tensor with the previously generated 128-depth tensor, resulting in the final tensor with depth=256.
 --> Standard Add operations were replaced by Brevitas qnn.QuantEltwiseAdd to allow for addition of QuantTensors.
 --> Dropout layers were removed from the model. QAT does not need dropout layers.
     -> nn.identity() was added in place of dropout layers to not alter the layer indexes, which is important for loading the weights for QAT.
@@ -66,72 +59,6 @@ class IntWeightPerTensorFloat(Int8WeightPerTensorFloat):
     bit_width = WEIGHT_BIT_WIDTH
 
 
-class AvgPoolFINNFriendly(nn.Module):
-    """
-    A replacement for the adaptive average pooling layers in the original model, which is compatible with quantization and export to ONNX and FINN.
-    This is done by using a depthwise convolution with kernel weights as 1/kernel_size, which is equivalent to average pooling, but allows for quantization and export to ONNX and FINN.
-    """
-
-    def __init__(self, channels: int, kernel_size: tuple[int, int] | int, return_quant_tensor=False):
-        super().__init__()
-        self.return_quant_tensor = return_quant_tensor
-        # Create the depthwise convolution layer with frozen weights of 1, which results in a depthwise sum of pixels in the kernel area.
-        self.pool = qnn.QuantConv2d(in_channels=channels,
-                                out_channels=channels,
-                                kernel_size=kernel_size,
-                                stride=kernel_size,
-                                groups=channels,
-                                bias=False,
-                                weight_quant=IntWeightPerTensorFloat,
-                                
-                                return_quant_tensor=False)
-        # Freeze the weights of the depthwise convolution layer to 1
-        for param in self.pool.parameters():
-            param.requires_grad = False
-        nn.init.constant_(self.pool.weight.data, 1.0)
-        self.pool.weight.data = self.pool.weight.data.to(torch.float32) # make sure the weights are in float32, since something was promoting the weights to double precision, which is not supported by FINN.
-
-        # Define the kernel area for the average pooling operation
-        if type(kernel_size) == int:
-            kernel_area = kernel_size * kernel_size
-        else:
-            kernel_area = kernel_size[0] * kernel_size[1]
-        avgpool_scale_factor = 1.0 / kernel_area # Defining a scale factor to assert a multiplication the forward method, since FINN does not support division operations.
-
-        # The output of the depthwise convolution layer is divided by the kernel area to get the average pooling result.
-        self.div = lambda x: x * avgpool_scale_factor
-
-        # Quantize the output of the average pooling operation using per-tensor quantization with a floating-point scale.
-        self.act_quant = qnn.QuantIdentity(act_quant=IntActPerTensorFloat, return_quant_tensor=True)
-
-    def forward(self, x):
-        x = self.pool(x)
-        x = self.div(x)
-        if self.return_quant_tensor:
-            x = self.act_quant(x)
-        return x
-
-
-class CustomQuantCat(qnn.QuantCat):
-    '''
-    A modification of the original qnn.QuantCat replacing QuantTensor.cat() with torch.cat(), since the QuantTensor does not have cat() method anymore (Brevitas Bug).
-    '''
-    def forward(self,
-                tensor_list: list[torch.Tensor] | list[QuantTensor],
-                dim: int = 1) -> torch.Tensor | QuantTensor:
-        quant_tensor_list = [self.unpack_input(t) for t in tensor_list]
-        # shortcut execution through the export impl during export
-        if self.export_mode:
-            out = self.export_handler([qt.value for qt in quant_tensor_list])
-            self._set_global_is_quant_layer(False)
-            return out
-        quant_tensor_list = [self.input_quant(qt) for qt in quant_tensor_list]
-        # trigger an assert if scale factors and bit widths are None or different
-        output = torch.cat(quant_tensor_list, dim=dim)
-        quant_output = self.output_quant(output)
-        return self.pack_output(quant_output)
-
-
 class QFastSCNN(nn.Module):
 
     def __init__(self, num_classes, mode="raw", **kwargs):
@@ -144,7 +71,7 @@ class QFastSCNN(nn.Module):
 
         self.inp_quant = qnn.QuantIdentity(act_quant=IntActPerTensorFloat, return_quant_tensor=True)
         self.learning_to_downsample = LearningToDownsample(32, 48, 64)
-        self.global_feature_extractor = GlobalFeatureExtractor(in_channels=64, block_channels=[64, 96, 128], out_channels=128, t=2, num_blocks=[2, 2, 2])
+        self.global_feature_extractor = GlobalFeatureExtractor(in_channels=64, block_channels=[64, 96, 128], out_channels=128, t=2, num_blocks=[1, 1, 1])
         self.feature_upsample = FeatureUpsampleModule(128, 128)
         self.classifier = Classifer(128, num_classes)
 
@@ -264,58 +191,18 @@ class LinearBottleneck(nn.Module):
             out = self.act_quant(out) # If there is no skip connection, we need to quantize the output before returning it.
         return out
 
-class PyramidPooling(nn.Module):
-    """
-    Pyramid pooling module
-
-    --> The pool sizes were changed from [1x1, 2x2, 3x3, 6x6] to [1x1, 2x2, 4x4, 8x8] for two distint reasons, since for ONNX export, the image size needs to be divisible by the pool size (in this case 32 and 64).
-    --> The original model uses adaptive average pooling, which can be replaced by a quantized version of standard Average Pooling with fixes pre defined kernel sizes.
-    --> The original model uses F.interpolate, which is being replaced by a QuantConvTranspose2d with frozen weights of torch.ones() to avoid issues when translating the model to ONNX and then to FINN, since onnx runtime outputs an error when a Resize block parameter is empty.
-    """
+class ContextAggregationModule(nn.Module):
+    """Context aggregation module"""
 
     def __init__(self, in_channels, out_channels, **kwargs):
-        super(PyramidPooling, self).__init__()
-        inter_channels = int(in_channels / 4)
-        self.conv1 = _ConvBNReLU(in_channels, inter_channels, 1, **kwargs)
-        self.conv2 = _ConvBNReLU(in_channels, inter_channels, 1, **kwargs)
-        self.conv3 = _ConvBNReLU(in_channels, inter_channels, 1, **kwargs)
-        self.conv4 = _ConvBNReLU(in_channels, inter_channels, 1, **kwargs)
-        self.out = _ConvBNReLU(in_channels * 2, out_channels, 1)
-
-        # [pool_out_H, pool_out_W] = [in_H, in_W] / kernel_size
-        # in_H and in_W are equal to the model input image sizes divided by 32.
-        in_H = IM_SIZE[0] // 32
-        self.pool_out_H = [1, 2, 4, 8]  # Kernel sizes for the pyramid pooling layers
-        self.kernel_size = [in_H // pool_out for pool_out in self.pool_out_H]  # Kernel sizes for the pyramid pooling layers during training
-
-        # The original model uses adaptive average pooling, which can be replaced by a standard Average Pooling with pre-defined kernel sizes.
-        # Necessary to create new instance for each pool size since the output size is a parameter in the quantized version.
-
-        self.pool1 = AvgPoolFINNFriendly(in_channels, self.kernel_size[0], return_quant_tensor=True)
-        self.pool2 = AvgPoolFINNFriendly(in_channels, self.kernel_size[1], return_quant_tensor=True)
-        self.pool3 = AvgPoolFINNFriendly(in_channels, self.kernel_size[2], return_quant_tensor=True)
-        self.pool4 = AvgPoolFINNFriendly(in_channels, self.kernel_size[3], return_quant_tensor=True)
-
-        # First Concat operation to concatenate the features with depth=32, resulting in a new tensor with depth=128; return_quant_tensor=False and output_quant=None since the next concat operation will quantize the output again.
-        self.concat1 = CustomQuantCat(return_quant_tensor=False,
-                                      input_quant=IntActPerTensorFloat, output_quant=None)
-        # Second Concat operation to concatenate the original tensor with depth=128 with the previously generated tensor with depth=128, resulting in the final tensor with depth=256.
-        self.concat2 = CustomQuantCat(return_quant_tensor=True,
-                                      input_quant=IntActPerTensorFloat, output_quant=IntActPerTensorFloat)
-
-    def upsample(self, x, scale_factor):
-            return F.interpolate(x, scale_factor=scale_factor, mode='nearest', recompute_scale_factor=False)
-
+            super(ContextAggregationModule, self).__init__()
+            self.conv1 = _ConvBNReLU(in_channels, in_channels, kernel_size=3, stride = 1, padding=1, **kwargs)
+            self.conv2 = _ConvBNReLU(in_channels, out_channels, kernel_size=1, stride = 1, padding=0, **kwargs)
+    
     def forward(self, x):
-
-        feat1 = self.upsample(self.conv1(self.pool1(x)), scale_factor=self.kernel_size[0])
-        feat2 = self.upsample(self.conv2(self.pool2(x)), scale_factor=self.kernel_size[1])
-        feat3 = self.upsample(self.conv3(self.pool3(x)), scale_factor=self.kernel_size[2])
-        feat4 = self.upsample(self.conv4(self.pool4(x)), scale_factor=self.kernel_size[3])
-
-        feat_concat = self.concat1([feat1, feat2, feat3, feat4])
-        x = self.concat2([x, feat_concat])
-        return self.out(x)
+        x = self.conv1(x)
+        x = self.conv2(x)
+        return x
 
 
 class LearningToDownsample(nn.Module):
@@ -343,7 +230,7 @@ class GlobalFeatureExtractor(nn.Module):
         self.bottleneck1 = self._make_layer(LinearBottleneck, in_channels, block_channels[0], num_blocks[0], t, 2)
         self.bottleneck2 = self._make_layer(LinearBottleneck, block_channels[0], block_channels[1], num_blocks[1], t, 2)
         self.bottleneck3 = self._make_layer(LinearBottleneck, block_channels[1], block_channels[2], num_blocks[2], t, 1)
-        self.ppm = PyramidPooling(block_channels[2], out_channels)
+        self.cag = ContextAggregationModule(block_channels[2], out_channels)
 
     def _make_layer(self, block, inplanes, planes, blocks, t=6, stride=1):
         layers = []
@@ -356,7 +243,7 @@ class GlobalFeatureExtractor(nn.Module):
         x = self.bottleneck1(x)
         x = self.bottleneck2(x)
         x = self.bottleneck3(x)
-        x = self.ppm(x)
+        x = self.cag(x)
         return x
 
 
@@ -401,9 +288,10 @@ class Classifer(nn.Module):
                             act_quant=IntOutActPerTensorFloat,
                             return_quant_tensor=False)
         )
+        self.out_quant = qnn.QuantIdentity(act_quant=IntOutActPerTensorFloat, return_quant_tensor=True)
 
     def forward(self, x):
         x = self.dsconv1(x)
         x = self.dsconv2(x)
         x = self.conv(x)
-        return x
+        return self.out_quant(x)

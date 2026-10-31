@@ -7,10 +7,10 @@
 '''
 From repo https://github.com/Tramac/Fast-SCNN-pytorch with the following modifications to make it compatible with translation to ONNX and then to FINN:
 --> The auxiliary output and the corresponding code in the training loop were removed since they are not being used in the training and can cause issues when translating the model to ONNX and then to FINN, which do not support multiple outputs.
---> The number of blocks in the GlobalFeatureExtractor was reduced from [3, 3, 3] to [2, 2, 2] to reduce model depth and FPGA FIFO's.
+--> The number of blocks in the GlobalFeatureExtractor was reduced from [3, 3, 3] to [1, 1, 1] to reduce model depth and FPGA FIFO's.
 --> Expand factor 't' reduced from 6 to 2 in the GlobalFeatureExtractor to reduce the number of parameters.
---> The interpolation upsamples in pyramid pooling and feature fusion modules were changed to use 'nearest' mode instead of 'bilinear' to avoid issues when translating the model to ONNX and then to FINN, which do not support 'bilinear' mode with align_corners=True.
---> The pool sizes in the pyramid pooling module were changed to be divisible by the input image size (in this case 32 and 64) to avoid issues when translating the model to ONNX and then to FINN.
+--> Pyramid Pooling module was replaced by a Context Aggregation module that uses a single 3x3 convolution followed by a 1x1 convolution to reduce the number of model FIFOs.
+--> Feature Fusion module was replaced by a new Feature Upsample Module that only upsamples the features from the Global Feature Extractor to match the input image size,the long skip connection was removed.
 '''
 
 """Fast Segmentation Convolutional Neural Network"""
@@ -26,8 +26,8 @@ class FastSCNN(nn.Module):
         super(FastSCNN, self).__init__()
         #self.aux = aux
         self.learning_to_downsample = LearningToDownsample(32, 48, 64)
-        # The number of blocks in the GlobalFeatureExtractor was reduced from [3, 3, 3] to [2, 2, 2] to reduce model depth and FPGA FIFO's.
-        self.global_feature_extractor = GlobalFeatureExtractor(in_channels=64, block_channels=[64, 96, 128], out_channels=128, t=2, num_blocks=[2, 2, 2])
+        # The number of blocks in the GlobalFeatureExtractor was reduced from [3, 3, 3] to [1, 1, 1] to reduce model depth and FPGA FIFO's.
+        self.global_feature_extractor = GlobalFeatureExtractor(in_channels=64, block_channels=[64, 96, 128], out_channels=128, t=2, num_blocks=[1, 1, 1])
         self.feature_upsample = FeatureUpsampleModule(128, 128)
         self.classifier = Classifer(128, num_classes)
         # Removing the tuple output since it can cause issues when translating the model to ONNX and then to FINN, and the auxiliary output is not being used in the training loop
@@ -131,33 +131,17 @@ class LinearBottleneck(nn.Module):
         return out
 
 
-class PyramidPooling(nn.Module):
-    """Pyramid pooling module"""
+class ContextAggregationModule(nn.Module):
+    """Context aggregation module"""
 
     def __init__(self, in_channels, out_channels, **kwargs):
-        super(PyramidPooling, self).__init__()
-        inter_channels = int(in_channels / 4)
-        self.conv1 = _ConvBNReLU(in_channels, inter_channels, 1, **kwargs)
-        self.conv2 = _ConvBNReLU(in_channels, inter_channels, 1, **kwargs)
-        self.conv3 = _ConvBNReLU(in_channels, inter_channels, 1, **kwargs)
-        self.conv4 = _ConvBNReLU(in_channels, inter_channels, 1, **kwargs)
-        self.out = _ConvBNReLU(in_channels * 2, out_channels, 1)
-
-    def pool(self, x, size):
-        avgpool = nn.AdaptiveAvgPool2d(size)
-        return avgpool(x)
-
-    def upsample(self, x, size):
-        return F.interpolate(x, size, mode='nearest')
+        super(ContextAggregationModule, self).__init__()
+        self.conv1 = _ConvBNReLU(in_channels, in_channels, kernel_size=3, stride = 1, padding=1, **kwargs)
+        self.conv2 = _ConvBNReLU(in_channels, out_channels, kernel_size=1, stride = 1, padding=0, **kwargs)
 
     def forward(self, x):
-        size = x.size()[2:]
-        feat1 = self.upsample(self.conv1(self.pool(x, 1)), size)
-        feat2 = self.upsample(self.conv2(self.pool(x, 2)), size)
-        feat3 = self.upsample(self.conv3(self.pool(x, 4)), size) # pool size from 3 to 4 since for onnx export the img size needs to be divisible by the pool size (in this case 32 and 64)
-        feat4 = self.upsample(self.conv4(self.pool(x, 8)), size) # pool size from 6 to 8 since for onnx export the img size needs to be divisible by the pool size (in this case 32 and 64)
-        x = torch.cat([x, feat1, feat2, feat3, feat4], dim=1)
-        x = self.out(x)
+        x = self.conv1(x)
+        x = self.conv2(x)
         return x
 
 
@@ -186,7 +170,7 @@ class GlobalFeatureExtractor(nn.Module):
         self.bottleneck1 = self._make_layer(LinearBottleneck, in_channels, block_channels[0], num_blocks[0], t, 2)
         self.bottleneck2 = self._make_layer(LinearBottleneck, block_channels[0], block_channels[1], num_blocks[1], t, 2)
         self.bottleneck3 = self._make_layer(LinearBottleneck, block_channels[1], block_channels[2], num_blocks[2], t, 1)
-        self.ppm = PyramidPooling(block_channels[2], out_channels)
+        self.cag = ContextAggregationModule(block_channels[2], out_channels)
 
     def _make_layer(self, block, inplanes, planes, blocks, t=6, stride=1):
         layers = []
@@ -199,35 +183,9 @@ class GlobalFeatureExtractor(nn.Module):
         x = self.bottleneck1(x)
         x = self.bottleneck2(x)
         x = self.bottleneck3(x)
-        x = self.ppm(x)
+        x = self.cag(x)
         return x
 
-
-class FeatureFusionModule(nn.Module):
-    """Feature fusion module"""
-
-    def __init__(self, highter_in_channels, lower_in_channels, out_channels, scale_factor=4, **kwargs):
-        super(FeatureFusionModule, self).__init__()
-        self.scale_factor = scale_factor
-        self.dwconv = _DWConv(lower_in_channels, out_channels, 1)
-        self.conv_lower_res = nn.Sequential(
-            nn.Conv2d(out_channels, out_channels, 1),
-            nn.BatchNorm2d(out_channels)
-        )
-        self.conv_higher_res = nn.Sequential(
-            nn.Conv2d(highter_in_channels, out_channels, 1),
-            nn.BatchNorm2d(out_channels)
-        )
-        self.relu = nn.ReLU(True)
-
-    def forward(self, higher_res_feature, lower_res_feature):
-        lower_res_feature = F.interpolate(lower_res_feature, scale_factor=4, mode='nearest')
-        lower_res_feature = self.dwconv(lower_res_feature)
-        lower_res_feature = self.conv_lower_res(lower_res_feature)
-
-        higher_res_feature = self.conv_higher_res(higher_res_feature)
-        out = higher_res_feature + lower_res_feature
-        return self.relu(out)
 
 class FeatureUpsampleModule(nn.Module):
     """Feature fusion module"""
