@@ -296,3 +296,35 @@ class RedefineImplStyle(Transformation):
             # This is necessary to avoid issues with the iteration over the graph nodes.
             return (model, True)
         return (model, False)
+
+
+class ChangeRAMStyle(Transformation):
+    """Change the ram_style type from a type to another for fpgadataflow nodes."""
+
+    def __init__(self, resourse_dict, old_ram_type, new_ram_type):
+        super().__init__()
+
+        possible_ram_types = ['block', 'ultra']
+        assert old_ram_type in possible_ram_types, f"old_ram_type must be in {possible_ram_types}, but got {old_ram_type}"
+        assert new_ram_type in possible_ram_types, f"new_ram_type must be in {possible_ram_types}, but got {new_ram_type}"
+        assert old_ram_type != new_ram_type, "old_ram_type and new_ram_type must be different."
+        self.new_memory_type = new_ram_type
+
+        if old_ram_type == 'block':
+            self.old_memory_type = 'BRAM_18K'
+        elif old_ram_type == 'ultra':
+            old_memory_type = 'URAM'
+
+        old_mem_list = []
+        for key, value in resourse_dict.items():
+            if value[old_memory_type] > 0:
+                old_mem_list.append(key)
+        self.affected_nodes = old_mem_list
+
+    def apply(self, model):
+        graph = model.graph
+        for node in graph.node:
+            if node.name in self.affected_nodes:
+                node_inst = getCustomOp(node)
+                node_inst.set_nodeattr("ram_style", self.new_memory_type)
+        return (model, False)
